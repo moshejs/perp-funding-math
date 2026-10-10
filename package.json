@@ -1,6 +1,6 @@
 {
   "name": "perp-funding-math",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Perpetual-futures funding math — the funding-rate formula (premium index, interest, clamp, caps), payments (longs-pay-shorts convention), APR/APY annualization for any interval, cumulative funding, cross-venue funding-arb carry and breakeven. Zero dependencies.",
   "keywords": [
     "funding-rate",
