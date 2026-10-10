@@ -3,8 +3,10 @@
  *
  * Funding payments with the standard sign convention (positive rate → longs
  * pay shorts), annualization of any funding interval to APR/APY, cumulative
- * funding over a rate history, TWAP funding, cross-venue funding-arbitrage
- * carry net of fees, and breakeven holding period.
+ * funding over a rate history, cross-venue funding-arbitrage carry net of
+ * fees, breakeven holding period, and the funding-rate formula itself
+ * (premium index, time-weighted average, interest component, clamp, caps)
+ * as used by BitMEX, Binance, Bybit and Hyperliquid.
  *
  * Rates are decimals per funding interval (0.0001 = 1 bp per interval, the
  * classic "0.01%" default). Position sides: "long" | "short".
@@ -28,6 +30,9 @@ function checkInterval(hours: number): void {
 
 /**
  * Funding paid (negative) or received (positive) for one interval.
+ * `notional` is the position value: size × mark price on Binance/Bybit,
+ * size × oracle price on Hyperliquid; for inverse contracts (e.g. BitMEX
+ * XBTUSD) pass the value in the settlement coin (contracts / mark price).
  * Convention: positive rate → longs PAY (returns negative for a long),
  * shorts RECEIVE (positive for a short).
  *
@@ -145,8 +150,11 @@ export function fundingArb(shortLeg: VenueLeg, longLeg: VenueLeg): FundingArbRes
   const shortApr = fundingApr(shortLeg.ratePerInterval, shortLeg.intervalHours);
   const longApr = fundingApr(longLeg.ratePerInterval, longLeg.intervalHours);
   const netCarryApr = shortApr - longApr;
-  const totalFees = (shortLeg.roundTripFee ?? 0) + (longLeg.roundTripFee ?? 0);
-  check(totalFees >= 0, "fees must be ≥ 0");
+  const shortFee = shortLeg.roundTripFee ?? 0;
+  const longFee = longLeg.roundTripFee ?? 0;
+  check(Number.isFinite(shortFee) && shortFee >= 0, `shortLeg.roundTripFee must be ≥ 0, got ${shortFee}`);
+  check(Number.isFinite(longFee) && longFee >= 0, `longLeg.roundTripFee must be ≥ 0, got ${longFee}`);
+  const totalFees = shortFee + longFee;
   const carryPerHour = netCarryApr / HOURS_PER_YEAR;
   const breakevenHours = carryPerHour > 0 ? totalFees / carryPerHour : Infinity;
   return {
@@ -155,4 +163,125 @@ export function fundingArb(shortLeg: VenueLeg, longLeg: VenueLeg): FundingArbRes
     breakevenHours,
     dailyCarryPerNotional: carryPerHour * 24,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Funding-rate formula
+// ---------------------------------------------------------------------------
+
+function clamp(x: number, lo: number, hi: number): number {
+  return Math.min(Math.max(x, lo), hi);
+}
+
+export interface PremiumIndexInput {
+  /** Average fill price to sell the impact notional into the bids. */
+  impactBid: number;
+  /** Average fill price to buy the impact notional from the asks. */
+  impactAsk: number;
+  /** Spot index price (Binance/Bybit "price index", Hyperliquid oracle price). */
+  indexPrice: number;
+}
+
+/**
+ * Instantaneous premium index (Binance, Bybit, Hyperliquid):
+ * `[max(0, impactBid − index) − max(0, index − impactAsk)] / index`.
+ * Zero while the index lies inside the impact bid/ask.
+ */
+export function premiumIndex({ impactBid, impactAsk, indexPrice }: PremiumIndexInput): number {
+  for (const [v, name] of [
+    [impactBid, "impactBid"],
+    [impactAsk, "impactAsk"],
+    [indexPrice, "indexPrice"],
+  ] as const) {
+    check(Number.isFinite(v) && v > 0, `${name} must be positive, got ${v}`);
+  }
+  check(impactBid <= impactAsk, `impactBid (${impactBid}) must be ≤ impactAsk (${impactAsk})`);
+  return (Math.max(0, impactBid - indexPrice) - Math.max(0, indexPrice - impactAsk)) / indexPrice;
+}
+
+/**
+ * Average of the premium-index samples taken over a funding interval, oldest
+ * first. `"linear"` weights sample i by i (Binance for intervals over 1 h,
+ * Bybit); `"equal"` is a plain mean (Binance 1 h intervals, Hyperliquid).
+ */
+export function averagePremiumIndex(
+  samples: readonly number[],
+  weighting: "linear" | "equal" = "linear",
+): number {
+  check(samples.length > 0, "samples must be non-empty");
+  check(weighting === "linear" || weighting === "equal", `weighting must be "linear"|"equal"`);
+  let sum = 0;
+  let weights = 0;
+  for (let i = 0; i < samples.length; i++) {
+    const v = samples[i]!;
+    check(Number.isFinite(v), `sample ${i} must be finite, got ${v}`);
+    const w = weighting === "linear" ? i + 1 : 1;
+    sum += w * v;
+    weights += w;
+  }
+  return sum / weights;
+}
+
+/**
+ * Interest component per funding interval from a daily rate:
+ * `dailyRate × intervalHours / 24`. The venues' default daily rate is 0.03%
+ * (0.01% per 8 h). On BitMEX `dailyRate` is quote rate − base rate.
+ */
+export function interestPerInterval(intervalHours: number, dailyRate = 0.0003): number {
+  checkInterval(intervalHours);
+  check(Number.isFinite(dailyRate), `dailyRate must be finite, got ${dailyRate}`);
+  return (dailyRate * intervalHours) / 24;
+}
+
+export interface FundingRateParams {
+  /** Premium index for the interval (usually {@link averagePremiumIndex}). */
+  premium: number;
+  /** Interest component per (8 h) interval. Default 0.0001 (0.01%). */
+  interestRate?: number;
+  /** Bound of the clamp on `interestRate − premium`. Default 0.0005 (±0.05%). */
+  clampBound?: number;
+  /**
+   * Multiplier applied after the clamp, before the cap: Binance uses
+   * `intervalHours / 8` for non-8 h intervals; Hyperliquid pays 1/8 of the
+   * 8 h rate every hour. Default 1.
+   */
+  scale?: number;
+  /** Funding-rate cap (upper limit), decimal. Default none. */
+  cap?: number;
+  /** Funding-rate floor (lower limit). Default `−cap`. */
+  floor?: number;
+}
+
+/**
+ * The standard perpetual funding-rate formula (BitMEX, Binance, Bybit,
+ * Hyperliquid):
+ * `F = clamp(scale × [P + clamp(I − P, −c, +c)], floor, cap)`.
+ *
+ * With the defaults (I = 0.01%, c = 0.05%) the rate equals the interest rate
+ * whenever the premium is within ±0.05% of it.
+ *
+ * ```ts
+ * fundingRate({ premium: 0.0003 });   // 0.0001 — inside the band
+ * fundingRate({ premium: 0.000762 }); // 0.000262 — P − 0.05%
+ * // Binance 4 h contract: scale by 4/8, cap/floor ±0.75 × MMR
+ * fundingRate({ premium: 0.001, scale: 4 / 8, cap: 0.75 * 0.004 });
+ * // Hyperliquid hourly payment, capped at 4%/h
+ * fundingRate({ premium: hourlyAvgPremium, scale: 1 / 8, cap: 0.04 });
+ * ```
+ */
+export function fundingRate(params: FundingRateParams): number {
+  const { premium, interestRate = 0.0001, clampBound = 0.0005, scale = 1, cap } = params;
+  check(Number.isFinite(premium), `premium must be finite, got ${premium}`);
+  check(Number.isFinite(interestRate), `interestRate must be finite, got ${interestRate}`);
+  check(Number.isFinite(clampBound) && clampBound >= 0, `clampBound must be ≥ 0, got ${clampBound}`);
+  check(Number.isFinite(scale) && scale > 0, `scale must be positive, got ${scale}`);
+  // P + clamp(I − P, −c, c), written so that the in-band case returns I exactly
+  const gap = interestRate - premium;
+  const unscaled = gap > clampBound ? premium + clampBound : gap < -clampBound ? premium - clampBound : interestRate;
+  const raw = scale * unscaled;
+  if (cap === undefined && params.floor === undefined) return raw;
+  const hi = cap ?? Infinity;
+  const lo = params.floor ?? (cap !== undefined ? -cap : -Infinity);
+  check(!Number.isNaN(hi) && !Number.isNaN(lo) && lo <= hi, `floor (${lo}) must be ≤ cap (${hi})`);
+  return clamp(raw, lo, hi);
 }
