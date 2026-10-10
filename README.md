@@ -1,6 +1,6 @@
 # perp-funding-math
 
-**Perpetual-futures funding math** — payments with the exchange sign convention (positive rate → longs pay shorts), APR/APY annualization for any funding interval, cumulative funding over a rate history, and **cross-venue funding-arbitrage** carry with breakeven. Zero dependencies.
+**Perpetual-futures funding math** — payments with the exchange sign convention (positive rate → longs pay shorts), APR/APY annualization for any funding interval, cumulative funding over a rate history, **cross-venue funding-arbitrage** carry with breakeven, and the **funding-rate formula** itself (premium index, time-weighted average, interest, clamp, caps). Zero dependencies.
 
 ```
 npm install perp-funding-math
@@ -32,7 +32,27 @@ Rates are decimals **per funding interval** (`0.0001` = 1 bp). Sides: `"long" | 
 - **`cumulativeFunding(notional, history, side)`** / **`averageFundingRate(history)`** — over `{ time, rate }[]`.
 - **`fundingArb(shortLeg, longLeg)`** — net carry APR across venues (mixed intervals normalize through APR), total round-trip fees, breakeven hours, daily carry per notional.
 
+- **`premiumIndex({ impactBid, impactAsk, indexPrice })`** — `[max(0, impactBid − index) − max(0, index − impactAsk)] / index`.
+- **`averagePremiumIndex(samples, weighting?)`** — `"linear"` (default; sample *i* weighted *i*, oldest first) or `"equal"`.
+- **`interestPerInterval(intervalHours, dailyRate = 0.0003)`** — `dailyRate × hours/24` (0.01% per 8 h).
+- **`fundingRate({ premium, interestRate = 0.0001, clampBound = 0.0005, scale = 1, cap?, floor? })`** — `clamp(scale × [P + clamp(I − P, −0.05%, +0.05%)], floor, cap)`; `floor` defaults to `−cap`.
+
+`fundingPayment`'s `notional` is the position value: size × mark price on Binance/Bybit, size × oracle price on Hyperliquid, and the coin value (contracts / mark) for inverse contracts.
+
 Invalid inputs throw `RangeError`.
+
+### Venue recipes
+
+All venues use the same core formula; they differ in sampling, interval scaling and caps (per their public docs, October 2026):
+
+| Venue | Premium | Call |
+| --- | --- | --- |
+| BitMEX (8 h) | `.XXXPI8H` index published at the previous funding time | `fundingRate({ premium, interestRate: interestPerInterval(8, quoteRate − baseRate) })` |
+| Binance, *N*-hour interval | 5-second samples, `"linear"` weights (`"equal"` for 1 h) | `fundingRate({ premium, scale: N / 8, cap, floor })` — cap ±0.75 × MMR on majors, ±2% otherwise |
+| Bybit, *N*-hour interval | 1-minute samples, `"linear"` weights | `fundingRate({ premium, interestRate: interestPerInterval(N), cap })` — cap min(0.75 × (IMR − MMR), MMR) |
+| Hyperliquid (paid hourly) | 5-second samples, `"equal"` weights over the hour | `fundingRate({ premium, scale: 1 / 8, cap: 0.04 })` |
+
+Venues change caps and intervals per symbol and in volatile markets; pass the current values. Checked against BitMEX's own XBTUSD history: 199 of 200 published 8-hour rates from 2021 (122 outside the ±0.05% band) are reproduced to the published 6 decimals; the exception is a period where BitMEX applied a limit this library doesn't model.
 
 ## Related
 
